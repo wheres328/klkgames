@@ -1,0 +1,874 @@
+// Modelo de datos v3 — plataforma gaming (ajustado tras auditoría).
+// Cambios clave: GameImage como fuente canónica de imágenes; GameSimilar (auto-relación);
+// GameRating única fuente de valoración; Download con store/type/order; Article.status;
+// UserHardware; Report con unique reporter+target; tiers de recomendación alineados (4).
+// No se han ejecutado migraciones todavía (FASE 3).
+// Búsqueda: planificar PostgreSQL FTS (tsvector+GIN) o pg_trgm en FASE 3; el índice btree
+// en name no sirve para subcadenas (ILIKE '%x%').
+// Contadores denormalizados (Game.rating, ratingCount, Genre.gameCount, Comment.likes):
+// sincronización a través del service layer (recálculo al escribir), no triggers.
+// Validaciones no expresables en Prisma (rating 1-5, "exactamente uno" de
+// Comment.gameId/articleId, similitud simétrica) se aplican en el servicio (zod, FASE 3).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================== ENUMS ==============================
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum GameStatus {
+  RELEASED
+  EARLY_ACCESS
+  UPCOMING
+  ABANDONED
+  DEMO
+}
+
+enum PricingModel {
+  FREE
+  PAID
+  FREE_TO_PLAY
+  DEMO
+}
+
+enum RecommendationTier {
+  EXCELENTE
+  BUENO
+  ACEPTABLE
+  NO_RECOMENDADO
+}
+
+enum ImageType {
+  COVER
+  BANNER
+  SCREENSHOT
+  GALLERY
+}
+
+enum ArticleStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum DownloadStore {
+  STEAM
+  GOG
+  EPIC
+  MICROSOFT
+  PLAYSTATION
+  XBOX
+  NINTENDO
+  OFFICIAL
+  OTHER
+}
+
+enum DownloadType {
+  STORE
+  WISHLIST
+  DOWNLOAD
+  CLIENT
+  OTHER
+}
+
+enum VideoType {
+  TRAILER
+  GAMEPLAY
+  REVIEW
+  DEVELOPER
+  OTHER
+}
+
+enum RequirementKind {
+  MINIMUM
+  RECOMMENDED
+}
+
+enum ReportTargetType {
+  GAME
+  ARTICLE
+  COMMENT
+  USER
+}
+
+enum ReportStatus {
+  PENDING
+  REVIEWED
+  RESOLVED
+  DISMISSED
+}
+
+enum GamePublishStatus {
+  // Estado editorial de un juego (independiente de GameStatus, que es la fase comercial).
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum AuditAction {
+  CREATE_GAME
+  UPDATE_GAME
+  PUBLISH_GAME
+  ARCHIVE_GAME
+  DELETE_GAME
+  CREATE_ARTICLE
+  UPDATE_ARTICLE
+  PUBLISH_ARTICLE
+  ARCHIVE_ARTICLE
+  DELETE_ARTICLE
+  CREATE_GENRE
+  UPDATE_GENRE
+  DELETE_GENRE
+  CREATE_PLATFORM
+  UPDATE_PLATFORM
+  DELETE_PLATFORM
+  CREATE_TAG
+  UPDATE_TAG
+  DELETE_TAG
+  UPDATE_USER
+  DELETE_USER
+  BAN_USER
+  UNBAN_USER
+  DELETE_COMMENT
+  HIDE_COMMENT
+  RESOLVE_REPORT
+  DISMISS_REPORT
+  UPLOAD_MEDIA
+  REPLACE_MEDIA
+  DELETE_MEDIA
+  UPDATE_SETTING
+  CREATE_BADGE
+  UPDATE_BADGE
+  DELETE_BADGE
+  AWARD_BADGE
+  REVOKE_BADGE
+  AWARD_REPUTATION
+  GRANT_ROLE
+  CREATE_DONATION
+  UPDATE_DONATION
+  DELETE_DONATION
+  CREATE_RANK
+  UPDATE_RANK
+  DELETE_RANK
+}
+
+enum AnalyticsEventName {
+  PAGE_VIEW
+  GAME_VIEW
+  ARTICLE_VIEW
+  SEARCH
+  DOWNLOAD_CLICK
+  EXTERNAL_LINK
+  FAVORITE_ADD
+  FAVORITE_REMOVE
+  RATING_CREATE
+  RATING_UPDATE
+  RATING_DELETE
+  COMMENT_CREATE
+  COMMENT_LIKE
+  COMMENT_UNLIKE
+  COMMENT_REPORT
+  LOGIN
+  LOGOUT
+  SIGNUP
+}
+
+// ============================== USERS ==============================
+
+model User {
+  id            String    @id @default(cuid())
+  username      String    @unique
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  cover         String?
+  passwordHash  String?
+  bio           String?
+  role          Role      @default(USER)
+  reputation    Int       @default(0)
+  rankId        String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  comments       Comment[]
+  ratings        GameRating[]
+  favorites      Favorite[]
+  commentLikes   CommentLike[]
+  articles       Article[]
+  reports        Report[] @relation("ReportReporter")
+  handledReports Report[] @relation("ReportHandler")
+  hardware       UserHardware[]
+  auditLogs      AuditLog[]
+  analyticsEvents AnalyticsEvent[]
+  sessions       Session[]
+  accounts       Account[]
+  badges         UserBadge[]
+  awardedBadges  UserBadge[] @relation("BadgeAwardedBy")
+  reputationLogs ReputationLog[]
+  adminApplications AdminApplication[] @relation("AdminApplicationUser")
+  reviewedApplications AdminApplication[] @relation("AdminApplicationReviewer")
+  rank           Rank?    @relation(fields: [rankId], references: [id], onDelete: SetNull)
+
+  @@index([role])
+  @@index([createdAt])
+  @@index([reputation])
+  @@index([rankId])
+}
+
+// ============================== AUTH (Better Auth) ==============================
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Account {
+  id                    String    @id @default(cuid())
+  userId                String
+  accountId             String
+  providerId            String
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier, expiresAt])
+}
+
+// ============================== GAMES ==============================
+
+model Game {
+  id              String            @id @default(cuid())
+  slug            String            @unique
+  name            String
+  description     String
+  longDescription String
+  developer       String
+  publisher       String
+  releaseDate     DateTime
+  rating          Float             @default(0)
+  ratingCount     Int               @default(0)
+  status          GameStatus        @default(RELEASED)
+  publishStatus   GamePublishStatus @default(DRAFT)
+  publishedAt     DateTime?
+  archivedAt      DateTime?
+  pricingModel    PricingModel      @default(PAID)
+  isSingleplayer  Boolean           @default(true)
+  isMultiplayer   Boolean           @default(false)
+  isIndie         Boolean           @default(false)
+  recommendedTier RecommendationTier @default(ACEPTABLE)
+  features        String[]
+  seoTitle        String?
+  seoDescription  String?
+  ogImage         String?
+  keywords        String[]          @default([])
+  zipPassword     String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  searchVector    Unsupported("tsvector")?
+
+  genres       Genre[]                 @relation("GameGenres")
+  platforms    Platform[]              @relation("GamePlatforms")
+  tags         Tag[]                   @relation("GameTags")
+  images       GameImage[]
+  videos       GameVideo[]
+  downloads    Download[]
+  requirements SystemRequirement[]
+  ratings      GameRating[]
+  favorites    Favorite[]
+  comments     Comment[]
+  views        GameView[]
+  hardwareRecommendations HardwareRecommendation[]
+  relatedArticles Article[]            @relation("ArticleRelatedGames")
+  similarSource GameSimilar[]          @relation("SimilarSource")
+  similarTarget GameSimilar[]          @relation("SimilarTarget")
+  analyticsEvents AnalyticsEvent[]
+
+  @@index([name])
+  @@index([releaseDate])
+  @@index([rating])
+  @@index([status])
+  @@index([publishStatus])
+  @@index([searchVector], type: Gin)
+}
+
+model Genre {
+  id           String  @id @default(cuid())
+  slug         String  @unique
+  name         String
+  // Imagen opcional: si está vacía la portada se dibuja con el patrón vectorial
+  // (patternStyle + patternSeed) sobre fondo oscuro.
+  image        String?
+  description  String
+  accentFrom   String
+  accentTo     String
+  patternStyle String?
+  patternSeed  Int?
+  gameCount    Int     @default(0)
+
+  games Game[] @relation("GameGenres")
+
+  @@index([name])
+}
+
+model Platform {
+  id        String @id @default(cuid())
+  slug      String @unique
+  name      String
+  shortName String
+
+  games     Game[] @relation("GamePlatforms")
+  downloads Download[]
+
+  @@index([name])
+}
+
+model Tag {
+  id   String @id @default(cuid())
+  slug String @unique
+  name String
+
+  games    Game[]    @relation("GameTags")
+  articles Article[] @relation("ArticleTags")
+
+  @@index([name])
+}
+
+model GameImage {
+  // Fuente canónica de las imágenes del juego (COVER/BANNER/SCREENSHOT/GALLERY).
+  // COVER y BANNER deben tener orden 0 (una única imagen por tipo); el servicio lo garantiza.
+  id     String    @id @default(cuid())
+  gameId String
+  type   ImageType
+  url    String
+  alt    String?
+  width  Int?
+  height Int?
+  order  Int       @default(0)
+  createdAt DateTime @default(now())
+
+  game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@unique([gameId, type, order])
+  @@index([gameId, type])
+  @@index([gameId])
+}
+
+model GameSimilar {
+  // Auto-relación Game ↔ Game para "juegos similares".
+  // Convención: gameId es SIEMPRE el id lexicográficamente menor del par (el servicio lo ordena).
+  // Así @@unique([gameId, relatedGameId]) evita duplicados y pares inversos a la vez,
+  // y "similares a X" se consulta con { OR: [{ gameId: X }, { relatedGameId: X }] }.
+  id            String  @id @default(cuid())
+  gameId        String
+  relatedGameId String
+  weight        Float   @default(0) // score de similitud (0-1); a mayor, más similar
+  order         Int     @default(0)
+  createdAt     DateTime @default(now())
+
+  game        Game @relation("SimilarSource", fields: [gameId], references: [id], onDelete: Cascade)
+  relatedGame Game @relation("SimilarTarget", fields: [relatedGameId], references: [id], onDelete: Cascade)
+
+  @@unique([gameId, relatedGameId])
+  @@index([relatedGameId])
+}
+
+model GameVideo {
+  id        String    @id @default(cuid())
+  gameId    String
+  type      VideoType
+  title     String
+  url       String
+  thumbnail String
+  provider  String?
+  order     Int       @default(0)
+
+  game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@unique([gameId, order])
+  @@index([gameId])
+}
+
+model Download {
+  // Enlace de descarga/comercialización por tienda o distribuidor.
+  // store = proveedor (Steam/GOG/Epic/…/Official/Other); platformId = plataforma (opcional,
+  // "cuando corresponda", p.ej. una entrada por consola). type = naturaleza del enlace.
+  id         String   @id @default(cuid())
+  gameId     String
+  store      DownloadStore
+  type       DownloadType @default(STORE)
+  name       String
+  url        String
+  platformId String?
+  version    String?
+  size       String?
+  isOfficial Boolean  @default(true)
+  order      Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  game     Game      @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  platform Platform? @relation(fields: [platformId], references: [id], onDelete: SetNull)
+
+  @@index([gameId])
+  @@index([platformId])
+  @@index([gameId, store, order])
+}
+
+model SystemRequirement {
+  id      String          @id @default(cuid())
+  gameId  String
+  kind    RequirementKind
+  os      String
+  cpu     String
+  gpu     String
+  ram     String
+  vram    String
+  storage String
+  directx String
+
+  game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@unique([gameId, kind])
+}
+
+model HardwareRecommendation {
+  id          String             @id @default(cuid())
+  gameId      String
+  tier        RecommendationTier
+  title       String?
+  description String?
+  notes       String?
+
+  game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@unique([gameId, tier])
+}
+
+model UserHardware {
+  // Perfil de hardware del usuario para "¿Puede mi PC correr este juego?" (comparado contra
+  // SystemRequirement en runtime). Los campos son strings legibles (display); la comparación
+  // se implementa en el servicio (FASE 3+). Múltiples perfiles por usuario con isActive.
+  id        String   @id @default(cuid())
+  userId    String
+  name      String   @default("Principal")
+  cpu       String
+  gpu       String
+  ram       String
+  vram      String?
+  storage   String?
+  isActive  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ============================== ARTICLES ==============================
+
+model Article {
+  id          String        @id @default(cuid())
+  slug        String        @unique
+  title       String
+  excerpt     String
+  image       String
+  category    String
+  content     Json
+  readTime    Int
+  status      ArticleStatus @default(DRAFT)
+  publishedAt DateTime      @default(now())
+  archivedAt  DateTime?
+  seoTitle    String?
+  seoDescription String?
+  updatedAt   DateTime      @updatedAt
+  authorId    String
+
+  author       User          @relation(fields: [authorId], references: [id])
+  tags         Tag[]         @relation("ArticleTags")
+  relatedGames Game[]        @relation("ArticleRelatedGames")
+  comments     Comment[]
+  views        ArticleView[]
+  analyticsEvents AnalyticsEvent[]
+
+  @@index([status, publishedAt])
+  @@index([publishedAt])
+  @@index([authorId])
+}
+
+// ============================== COMMUNITY ==============================
+
+model Comment {
+  // Invariante "exactamente uno": gameId o articleId (nunca ambos, nunca ninguno) — validar en servicio.
+  // Política de borrado: soft-delete (deletedAt) para preservar discusión; authorId con Restrict
+  // para no cascadear comentarios al borrar un usuario (anonymize/soft-delete en servicio).
+  id        String   @id @default(cuid())
+  gameId    String?
+  articleId String?
+  authorId  String
+  parentId  String?
+  content   String
+  likes     Int      @default(0)
+  edited    Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  author  User      @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  parent  Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies Comment[] @relation("CommentReplies")
+  game    Game?     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  article Article?  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  gameRating GameRating?
+  commentLikes CommentLike[]
+
+  @@index([gameId, createdAt])
+  @@index([articleId, createdAt])
+  @@index([authorId])
+  @@index([parentId])
+}
+
+model CommentLike {
+  id        String   @id @default(cuid())
+  commentId String
+  userId    String
+  createdAt DateTime @default(now())
+
+  comment Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([commentId, userId])
+}
+
+model Favorite {
+  id        String   @id @default(cuid())
+  userId    String
+  gameId    String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, gameId])
+  @@index([gameId])
+}
+
+model GameRating {
+  // Fuente única de valoración. Un rating por (usuario, juego); independiente de comentarios
+  // (valorar sin comentar / comentar sin valorar). commentId es un enlace OPCIONAL 1:1
+  // (el servicio debe garantizar que el comentario y el rating pertenecen al mismo usuario/juego).
+  // value: rango 1-5 validado en servicio (Prisma no expresa CHECK).
+  id        String   @id @default(cuid())
+  userId    String
+  gameId    String
+  value     Int
+  commentId String? @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  game    Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  comment Comment? @relation(fields: [commentId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, gameId])
+  @@index([gameId, value])
+  @@index([gameId])
+}
+
+model Report {
+  id         String           @id @default(cuid())
+  reporterId String
+  handlerId  String?
+  targetType ReportTargetType
+  targetId   String
+  reason     String
+  status     ReportStatus     @default(PENDING)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  reporter User  @relation("ReportReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  handler  User? @relation("ReportHandler", fields: [handlerId], references: [id], onDelete: SetNull)
+
+  @@unique([reporterId, targetType, targetId])
+  @@index([targetType, targetId])
+  @@index([status])
+  @@index([reporterId])
+}
+
+model GameView {
+  id     String   @id @default(cuid())
+  gameId String
+  date   DateTime @db.Date
+  views  Int      @default(0)
+
+  game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@unique([gameId, date])
+}
+
+model ArticleView {
+  id        String   @id @default(cuid())
+  articleId String
+  date      DateTime @db.Date
+  views     Int      @default(0)
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@unique([articleId, date])
+}
+
+// ============================== MEDALLAS (BADGES) ==============================
+
+model Badge {
+  // Definición de medalla que los admins/moderadores pueden otorgar a los usuarios.
+  // image: URL del icono/medalla (puede ser una URL externa).
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  description String
+  image       String
+  createdAt   DateTime @default(now())
+
+  awardedTo UserBadge[]
+
+  @@index([name])
+}
+
+model UserBadge {
+  // Medalla otorgada a un usuario. Una misma medalla solo se puede otorgar una vez
+  // por usuario (unique userId+badgeId); el actor queda registrado en awardedBy.
+  id          String   @id @default(cuid())
+  userId      String
+  badgeId     String
+  awardedById String?
+  reason      String?
+  createdAt   DateTime @default(now())
+
+  user       User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  badge      Badge @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+  awardedBy  User? @relation("BadgeAwardedBy", fields: [awardedById], references: [id], onDelete: SetNull)
+
+  @@unique([userId, badgeId])
+  @@index([badgeId])
+  @@index([userId])
+}
+
+// ============================== ADMINISTRACIÓN ==============================
+
+model AuditLog {
+  // Registro de acciones administrativas: quién, qué hizo, sobre qué y cuándo.
+  // Se escribe centralizadamente desde el service layer (no disperso en la UI).
+  id         String      @id @default(cuid())
+  actorId    String?
+  action     AuditAction
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime    @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([actorId])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+model SiteSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// Enlaces de redes sociales del pie de página, gestionables desde el panel.
+model SocialLink {
+  id        String   @id @default(cuid())
+  name      String
+  url       String
+  icon      String?
+  color     String?
+  order     Int      @default(0)
+  visible   Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+// ============================== ANALYTICS ==============================
+// Tráfico respetuoso con la privacidad: sin IP en texto plano (o hash de
+// retención limitada), sin PII. El visitante se identifica con un id aleatorio
+// en cookie (vortex_vid) que no se relaciona con User.
+
+model AnalyticsSession {
+  id        String   @id @default(cuid())
+  visitorId String
+  startedAt DateTime @default(now())
+  endedAt   DateTime?
+  referrer  String?
+  userAgent String?
+  device    String?
+  browser   String?
+  os        String?
+
+  events AnalyticsEvent[]
+
+  @@index([visitorId])
+  @@index([startedAt])
+}
+
+model AnalyticsEvent {
+  id        String              @id @default(cuid())
+  sessionId String
+  name      AnalyticsEventName
+  path      String?
+  referrer  String?
+  device    String?
+  browser   String?
+  os        String?
+  gameId    String?
+  articleId String?
+  userId    String?
+  metadata  Json?
+  createdAt DateTime            @default(now())
+
+  session AnalyticsSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  game    Game?            @relation(fields: [gameId], references: [id], onDelete: SetNull)
+  article Article?         @relation(fields: [articleId], references: [id], onDelete: SetNull)
+  user    User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([name, createdAt])
+  @@index([path, createdAt])
+  @@index([gameId, createdAt])
+  @@index([articleId, createdAt])
+  @@index([sessionId])
+  @@index([createdAt])
+}
+
+// ============================== REPUTATION ==============================
+
+enum ReputationReason {
+  COMMENT_CREATED
+  COMMENT_LIKE_RECEIVED
+  GAME_RATED
+  ADMIN_AWARD
+}
+
+model ReputationLog {
+  id          String           @id @default(cuid())
+  userId      String
+  delta       Int
+  reason      ReputationReason
+  referenceId String?
+  note        String?
+  createdAt   DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@unique([userId, reason, referenceId])
+}
+
+enum AdminApplicationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model AdminApplication {
+  id                 String               @id @default(cuid())
+  userId             String
+  message            String
+  reputationAtSubmit Int
+  status             AdminApplicationStatus @default(PENDING)
+  reviewNote         String?
+  reviewedBy         String?
+  reviewedAt         DateTime?
+  createdAt          DateTime             @default(now())
+
+  user     User @relation("AdminApplicationUser", fields: [userId], references: [id], onDelete: Cascade)
+  reviewer User? @relation("AdminApplicationReviewer", fields: [reviewedBy], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@index([userId])
+}
+
+// ============================== DONATIONS ==============================
+
+enum DonationPlatform {
+  PATREON
+  PAYPAL
+  CRYPTO
+}
+
+model Donation {
+  id        String           @id @default(cuid())
+  platform  DonationPlatform
+  url       String
+  label     String?
+  address   String?
+  order     Int              @default(0)
+  active    Boolean          @default(true)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  @@index([active, order])
+}
+
+// ============================== RANKS ==============================
+
+model Rank {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  color       String?
+  permissions String[]
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users User[]
+
+  @@index([isDefault])
+}
