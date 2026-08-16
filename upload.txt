@@ -1,0 +1,190 @@
+============================================================
+  KLKgames - GUIA DE DESPLIEGUE EN HOSTING (VPS + Docker)
+  Repo: https://github.com/wheres328/klkgames
+============================================================
+
+0) QUE NECESITAS
+   - NO necesitas descargar nada en tu PC. Todo ya esta en GitHub.
+   - El hosting debe ser un VPS con acceso SSH (root o sudo).
+     Si es hosting compartido (cPanel/Plesk) NO sirve para este
+     proyecto (Next.js con servidor y base de datos dinamica).
+   - En el VPS: Docker + Docker Compose + un dominio apuntando
+     al IP del servidor.
+
+   Usuarios y contrasenas por defecto:
+     BD postgres  -> postgres / postgres  (cambiar en produccion)
+     Admin web    -> admin@vortex.com / Admin123!
+
+============================================================
+A) PREPARAR EL SERVIDOR (una sola vez)
+============================================================
+
+1) Entra por SSH a tu servidor (desde Windows PowerShell):
+     ssh root@IP_DE_TU_SERVIDOR
+
+2) Actualiza el sistema:
+     apt update && apt upgrade -y
+
+3) Instala Docker y Docker Compose:
+     curl -fsSL https://get.docker.com | sh
+     systemctl enable --now docker
+
+4) Comprueba que quedaron instalados:
+     docker --version
+     docker compose version
+
+============================================================
+B) DESCARGAR EL PROYECTO EN EL SERVIDOR
+============================================================
+
+5) Clona el repositorio (dentro de /root o /opt):
+     git clone https://github.com/wheres328/klkgames.git
+     cd klkgames
+
+6) Crea el archivo de variables de entorno:
+     cp .env.example .env
+
+7) Rellena .env con 2 valores CLAVE (edita con nano):
+     nano .env
+     - AUTH_SECRET: genera uno con  npx @better-auth/cli secret
+       (o usa una frase aleatoria larga de 32+ caracteres).
+       DEBE ser el mismo siempre (no lo cambies o se cierran
+       todas las sesiones de los usuarios).
+     - BETTER_AUTH_URL: tu dominio, por ejemplo
+       https://klkgames.tudominio.com
+
+============================================================
+C) LEVANTAR LA BASE DE DATOS Y LA APP (Docker)
+============================================================
+
+8) Levanta SOLO la base de datos (PostgreSQL):
+     docker compose -f docker-compose.deploy.yml up -d db
+
+9) Construye la imagen de la app (necesita la BD, por eso el
+   paso 8 va antes):
+     docker compose -f docker-compose.deploy.yml build app
+
+10) Levanta todo (app + db):
+     docker compose -f docker-compose.deploy.yml up -d
+
+    La app arranca sola y APLICA LAS MIGRACIONES de la BD
+    automaticamente (esto crea todas las tablas).
+
+11) Comprueba que esta funcionando:
+     docker compose -f docker-compose.deploy.yml ps
+     curl http://localhost:3000
+
+    Si algo falla, mira los logs:
+     docker compose -f docker-compose.deploy.yml logs -f app
+
+12) (Opcional) Datos de demo: solo si quieres juegos/articulos
+    de ejemplo para probar. Ejecuta una vez:
+     docker compose -f docker-compose.deploy.yml exec app \
+       npx prisma db seed
+     (o si quieres el admin demo: el seed base ya crea
+      admin@vortex.com con Admin123!)
+
+============================================================
+D) EXPONER LA WEB (dominio + HTTPS) - con Nginx
+============================================================
+
+13) Instala Nginx (en el servidor, no en Docker):
+     apt install -y nginx
+
+14) Crea el archivo del sitio:
+     nano /etc/nginx/sites-available/klkgames
+
+    Contenido (cambia klkgames.tudominio.com por TU dominio):
+
+       server {
+           listen 80;
+           server_name klkgames.tudominio.com;
+
+           location / {
+               proxy_pass http://127.0.0.1:3000;
+               proxy_http_version 1.1;
+               proxy_set_header Host $host;
+               proxy_set_header X-Real-IP $remote_addr;
+               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+               proxy_set_header X-Forwarded-Proto $scheme;
+           }
+       }
+
+15) Activa el sitio y recarga Nginx:
+     ln -s /etc/nginx/sites-available/klkgames /etc/nginx/sites-enabled/
+     nginx -t
+     systemctl reload nginx
+
+16) HTTPS gratis con Let's Encrypt:
+     apt install -y certbot python3-certbot-nginx
+     certbot --nginx -d klkgames.tudominio.com
+
+    Tras esto, actualiza BETTER_AUTH_URL a https:// en el .env
+    y reinicia la app:
+     nano .env        (cambia BETTER_AUTH_URL a https)
+     docker compose -f docker-compose.deploy.yml up -d --force-recreate app
+
+============================================================
+E) ACTUALIZAR LA APP EN EL FUTURO (despues de cambios)
+============================================================
+
+17) En TU PC: sube los cambios a GitHub
+     git add .
+     git commit -m "tu mensaje"
+     git push
+
+18) En el SERVIDOR: trae los cambios y reconstruye
+     cd klkgames
+     git pull
+     docker compose -f docker-compose.deploy.yml build app
+     docker compose -f docker-compose.deploy.yml up -d
+
+============================================================
+F) SEGURIDAD (recomendado antes de salir a internet)
+============================================================
+
+19) Cambia la contrasena de la BD postgres (NO dejes postgres/postgres):
+     docker compose -f docker-compose.deploy.yml exec db \
+       psql -U postgres -c "ALTER USER postgres WITH PASSWORD 'nueva_clave';"
+     Despues edita .env / docker-compose.deploy.yml y usa la
+     nueva clave en DATABASE_URL (ambos lugares: build arg y env).
+
+20) Cambia la contrasena del admin web:
+     entra a /login como admin@vortex.com / Admin123! y
+     cambiala desde el panel (o regenere el seed con otra clave).
+
+21) Abre solo los puertos necesarios en el firewall:
+     - 80 y 443 (web) 
+     - 22 (SSH)
+     Cierra el 3000 y el 5432 al exterior. Con Nginx del paso 13-16
+     la app solo se ve por 80/443.
+
+22) Haz copias de seguridad de la BD (los datos viven en el volumen
+    docker "klkgames-pgdata"):
+     docker compose -f docker-compose.deploy.yml exec db \
+       pg_dump -U postgres gaming > backup_$(date +%F).sql
+
+============================================================
+G) PREGUNTAS FRECUENTES
+============================================================
+
+- "Necesito Docker en mi PC?" NO. Docker solo se usa en el servidor.
+  En tu PC solo editas codigo y haces git push.
+
+- "Cambie el AUTH_SECRET y me saco a todos" - Correcto, no lo cambies
+  despues de lanzar.
+
+- "No me carga la web pero el contenedor esta arriba" - Revisa
+  firewall (puerto 3000 cerrado) o que el dominio apunte al IP.
+
+- "La BD no arranca" - `docker compose -f docker-compose.deploy.yml
+  logs db`. Suele ser conflicto de puerto 5432 en el servidor.
+
+- Version local sin Docker (opcional): Node 20 + Postgres 17
+  instalados directo, `npm ci`, `npx prisma migrate deploy`,
+  `npm run build`, `npm run start` y Nginx como proxy. El metodo
+  Docker de arriba es el recomendado.
+
+============================================================
+FIN DE LA GUIA
+============================================================

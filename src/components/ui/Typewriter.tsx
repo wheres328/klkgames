@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 
 interface TypewriterProps {
   text: string;
@@ -9,10 +9,18 @@ interface TypewriterProps {
   className?: string;
 }
 
+function subscribeReducedMotion(onChange: () => void) {
+  const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+  media.addEventListener("change", onChange);
+  return () => media.removeEventListener("change", onChange);
+}
+
+function getReducedMotion() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
 export function Typewriter({ text, speed = 65, pause = 2600, className }: TypewriterProps) {
-  const [reduced] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches,
-  );
+  const reduced = useSyncExternalStore(subscribeReducedMotion, getReducedMotion, () => false);
   const [display, setDisplay] = useState("");
 
   useEffect(() => {
